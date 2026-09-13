@@ -207,6 +207,9 @@ enum HelpTopic: String, CaseIterable, Identifiable {
             Bullet("A hollow dot and grey italic name means the person is marked away.")
             H("Leaving")
             P("Right-click the channel → Leave Channel, or type /part while in it.")
+            H("Cycling (leave and come straight back)")
+            P("Right-click the channel → Cycle Channel, or type /cycle (also /hop or /rejoin). Relay leaves and immediately re-joins, keeping the window and everything already said in it. Useful to shake off a ban that was just lifted, to refresh a stale member list, or to retake ops in a channel that emptied out.")
+            P("You can also re-join a channel whose window is still open just by typing /join #channel again — handy after a kick. Add the key if the channel has one: /join #channel secretkey.")
         }
 
         case .talking: HelpPage {

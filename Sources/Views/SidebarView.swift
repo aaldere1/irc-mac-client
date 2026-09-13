@@ -75,6 +75,7 @@ struct SidebarView: View {
                 Button("Clear Modes") { model.xChannelClearmode(conv.id) }
             }
             Divider()
+            Button("Cycle Channel") { model.cycleChannel(conv.id) }
             Button("Leave Channel", role: .destructive) { model.remove(conv.id) }
         } else if conv.kind == .directMessage {
             Button(conv.isMuted ? "Unquiet" : "Quiet") { model.toggleMute(conv.id) }

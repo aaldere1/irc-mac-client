@@ -60,9 +60,14 @@ enum MessageGrouper {
             let summary = names.joined(separator: ", ")
                 + (extra > 0 ? " +\(extra) others" : "")
                 + "  ·  " + verbs.joined(separator: ", ")
+            // m.text carries the REASON ("left (bye)", "quit (ping timeout)"),
+            // not a hostmask — render it as the tail of the sentence so part /
+            // quit reasons are actually readable.
             let lines = eventBuffer.map { m -> String in
-                let verb = m.kind == .join ? "joined" : m.kind == .part ? "left" : "quit"
-                return "*** \(m.nick) (\(m.text)) has \(verb)"
+                let tail = m.text.isEmpty
+                    ? (m.kind == .join ? "joined" : m.kind == .part ? "left" : "quit")
+                    : m.text
+                return "*** \(m.nick) has \(tail)"
             }
             rows.append(.events(id: eventBuffer[0].id, summary: summary, lines: lines, group: eventBuffer))
             eventBuffer.removeAll()
@@ -88,7 +93,7 @@ enum MessageGrouper {
                 rows.append(.action(m)); previousNick = nil
             case .notice:
                 rows.append(.notice(m)); previousNick = nil
-            case .server, .whois:
+            case .server, .whois, .kick:
                 rows.append(.server(m)); previousNick = nil
             case .message:
                 let grouped = previousNick == m.nick

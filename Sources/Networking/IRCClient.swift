@@ -27,7 +27,15 @@ enum IRCEvent {
     /// Full ban list for a channel (from RPL_BANLIST 367/368).
     case banList(conversationID: String, masks: [String])
     /// A single ban added/removed live (MODE +b / -b).
-    case ban(conversationID: String, mask: String, added: Bool)
+    case ban(conversationID: String, mask: String, added: Bool, by: String)
+    /// A server line about a conversation, delivered there ONLY if that
+    /// conversation already exists — otherwise it falls back to the server
+    /// console. Numerics must never conjure a channel/DM window.
+    case contextLine(conversationID: String, text: String)
+    /// The nick the server actually registered us with (RPL_WELCOME 001).
+    /// Adopted unconditionally — after a collision fallback or a private
+    /// session this is the only thing that tells the app who it now is.
+    case selfNickConfirmed(networkID: String, nick: String)
     case nickChanged(networkID: String, from: String, to: String)
     /// Join refused: 471 full, 473 invite-only, 474 banned, 475 needs key.
     case joinFailed(networkID: String, channel: String, code: Int, reason: String)
@@ -50,7 +58,7 @@ protocol IRCClient: AnyObject {
 
     func send(text: String, to conversationID: String) async
     func sendAction(_ action: String, to conversationID: String) async
-    func join(channel: String, networkID: String) async
+    func join(channel: String, key: String?, networkID: String) async
     func part(conversationID: String) async
     func setTopic(_ topic: String, conversationID: String) async
     func changeNick(_ nick: String, networkID: String) async

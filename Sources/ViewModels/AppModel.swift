@@ -42,6 +42,9 @@ final class AppModel {
     /// Set to a nick to highlight + scroll it in the member list (cleared there).
     var revealedMember: String?
     @ObservationIgnored private var whoisTargetConvID: String?
+    /// Nick the user explicitly asked for, per network — only such a rename is
+    /// persisted back to the server config.
+    @ObservationIgnored private var requestedNick: [String: (nick: String, at: Date)] = [:]
 
     // Composer input history (↑/↓ recall), auto-reconnect and private-session
     // bookkeeping, and the Notification Center bridge.
@@ -135,6 +138,19 @@ final class AppModel {
     var selectedNetwork: Network? { network(for: selectedID) }
     var selfNick: String { selectedNetwork?.nick ?? AppModel.selfNickPlaceholder }
 
+    /// Our current nick on a specific network. Event handlers must use this —
+    /// `selfNick` follows the SELECTED network, so an event arriving for any
+    /// other network was being compared against the wrong nick.
+    func selfNick(onNetwork netID: String) -> String {
+        networks.first { $0.id == netID }?.nick ?? AppModel.selfNickPlaceholder
+    }
+
+    /// Is this nick us, on the network that owns `convID`? (Nicks are
+    /// case-insensitive on IRC.)
+    func isSelf(_ nick: String, in convID: String) -> Bool {
+        nick.caseInsensitiveCompare(selfNick(onNetwork: networkID(of: convID))) == .orderedSame
+    }
+
     /// Flat, ordered list of selectable conversations (skips server consoles) —
     /// used by ⌘1–9 and the quick switcher.
     var flatConversations: [(conv: Conversation, network: Network)] {
@@ -185,7 +201,7 @@ final class AppModel {
                     $0.name = message.nick
                 }
             }
-            appendMessage(to: convID, message, incoming: message.nick != selfNick)
+            appendMessage(to: convID, message, incoming: !isSelf(message.nick, in: convID))
 
         case let .topic(convID, topic):
             mutateConversation(convID) { $0.topic = topic }
@@ -203,12 +219,12 @@ final class AppModel {
                 if $0.kind == .channel, $0.name != serverName { $0.name = serverName }
             }
             appendMessage(to: convID, Message(id: UUID().uuidString, kind: .join, nick: member.nick, text: "joined"),
-                          incoming: member.nick != selfNick)
+                          incoming: !isSelf(member.nick, in: convID))
 
         case let .memberLeft(convID, nick, reason, kind):
             mutateConversation(convID) { $0.members.removeAll { $0.nick == nick } }
             appendMessage(to: convID, Message(id: UUID().uuidString, kind: kind, nick: nick, text: reason),
-                          incoming: nick != selfNick)
+                          incoming: !isSelf(nick, in: convID))
 
         case let .userQuit(networkID, nick, reason):
             for (cid, conv) in conversations
@@ -248,35 +264,86 @@ final class AppModel {
         case let .banList(convID, masks):
             mutateConversation(convID) { $0.bans = masks }
 
-        case let .ban(convID, mask, added):
+        case let .ban(convID, mask, added, by):
             mutateConversation(convID) {
                 if added { if !$0.bans.contains(mask) { $0.bans.append(mask) } }
                 else { $0.bans.removeAll { $0 == mask } }
             }
+            let actor = by.isEmpty ? "" : " by \(by)"
             appendMessage(to: convID, Message(id: UUID().uuidString, kind: .server,
-                                              text: "*** \(mask) was \(added ? "banned" : "unbanned")"),
+                                              text: "*** \(mask) was \(added ? "banned" : "unbanned")\(actor)"),
                           incoming: true)
 
+        case let .contextLine(convID, text):
+            // Deliver to the conversation only when it already exists — never
+            // create one from a server numeric.
+            let cid = canonicalConvID(convID)
+            let target = conversations[cid] != nil ? cid : "\(networkID(of: cid))/$server"
+            appendMessage(to: target, Message(id: UUID().uuidString, kind: .server, text: text))
+
+        case let .selfNickConfirmed(networkID, confirmed):
+            // Adopt without persisting: this may be a collision fallback or a
+            // private-session nick, but it IS who we are on the wire now.
+            if networks.first(where: { $0.id == networkID })?.nick != confirmed {
+                mutateNetwork(networkID) { $0.nick = confirmed }
+                highlightRegexKey = ""
+            }
+
         case let .nickChanged(networkID, from, to):
-            // Update our own nick only if it was ours.
-            if networks.first(where: { $0.id == networkID })?.nick == from {
+            // Was that us? Compare case-insensitively — IRC nicks are, and an
+            // exact-case miss here left `selfNick` (and therefore the nick on
+            // every line we type, plus highlighting) stuck on the dead nick.
+            let wasMine = networks.first(where: { $0.id == networkID })?
+                .nick.caseInsensitiveCompare(from) == .orderedSame
+            if wasMine {
                 mutateNetwork(networkID) { $0.nick = to }
+                // Persist ONLY the rename the user actually asked for. Every
+                // other source — the transport's collision fallback (433/432 →
+                // alt nick, nick_, Relay1234), a services-forced Guest12345, a
+                // private-session nick — must never overwrite the configured
+                // nick on disk. Intent, not connection state, is the test.
+                // Honour the request only briefly: a refused /nick leaves no
+                // event behind, and a stale entry would later mistake a
+                // collision fallback landing on that same nick for intent.
+                let pending = requestedNick[networkID]
+                let wasRequested = pending?.nick.caseInsensitiveCompare(to) == .orderedSame
+                    && Date().timeIntervalSince(pending?.at ?? .distantPast) < 60
+                requestedNick[networkID] = nil          // one shot, either way
+                if wasRequested,
+                   let i = serverConfigs.firstIndex(where: { $0.id == networkID }),
+                   serverConfigs[i].nick != to {
+                    serverConfigs[i].nick = to
+                    saveServers()
+                    Task { [serverConfigs] in await hub.updateConfigs(serverConfigs) }
+                }
+                // Force the highlight regex to recompile against the new nick.
+                highlightRegexKey = ""
+                appendMessage(to: "\(networkID)/$server",
+                              Message(id: UUID().uuidString, kind: .server,
+                                      text: "*** You are now known as \(to)"))
             }
             // Rename the member in every channel they're in, and log it.
             for (cid, conv) in conversations
             where self.networkID(of: cid) == networkID && conv.kind == .channel
-                  && conv.members.contains(where: { $0.nick == from }) {
+                  && conv.members.contains(where: { $0.nick.caseInsensitiveCompare(from) == .orderedSame }) {
                 mutateConversation(cid) {
-                    if let i = $0.members.firstIndex(where: { $0.nick == from }) { $0.members[i].nick = to }
+                    if let i = $0.members.firstIndex(where: { $0.nick.caseInsensitiveCompare(from) == .orderedSame }) {
+                        $0.members[i].nick = to
+                    }
                 }
-                appendMessage(to: cid, Message(id: UUID().uuidString, kind: .server, text: "\(from) is now known as \(to)"))
+                appendMessage(to: cid, Message(id: UUID().uuidString, kind: .server,
+                                               text: wasMine ? "*** You are now known as \(to)"
+                                                             : "*** \(from) is now known as \(to)"))
             }
 
         case let .joinFailed(networkID, channel, code, reason):
-            let cid = "\(networkID)/\(channel)"
-            ensureConversation(cid)
-            appendMessage(to: cid, Message(id: UUID().uuidString, kind: .server,
-                                           text: "*** Cannot join \(channel): \(reason)"))
+            // Report into the channel window only if one is already open —
+            // creating it would put a channel we are NOT in on the sidebar,
+            // which performOnConnect would then auto-rejoin on every reconnect.
+            let cid = canonicalConvID("\(networkID)/\(channel)")
+            let target = conversations[cid] != nil ? cid : "\(networkID)/$server"
+            appendMessage(to: target, Message(id: UUID().uuidString, kind: .server,
+                                              text: "*** Cannot join \(channel): \(reason)"))
             joinFailure = JoinFailure(networkID: networkID, channel: channel, code: code, reason: reason)
         }
     }
@@ -368,7 +435,7 @@ final class AppModel {
     private func countsAsActivity(_ m: Message, in conv: Conversation) -> Bool {
         switch m.kind {
         case .message, .action:       return true
-        case .join, .part, .quit, .server: return conv.kind == .channel
+        case .join, .part, .quit, .server, .kick: return conv.kind == .channel
         case .notice, .whois:         return false
         }
     }
@@ -472,7 +539,18 @@ final class AppModel {
         }
         case "join":  if !arg.isEmpty { joinChannel(arg) }
         case "part":  partCurrent()
-        case "nick":  if let n = rest.first { Task { await client.changeNick(n, networkID: netID) } }
+        case "cycle", "hop", "rejoin":
+            // /cycle [#channel] — defaults to the current channel.
+            if let named = rest.first, !named.isEmpty {
+                cycleChannel(canonicalConvID("\(netID)/\(AppModel.normalizedChannel(named))"))
+            } else {
+                cycleChannel(selectedID)
+            }
+        case "nick":
+            if let n = rest.first, !n.isEmpty {
+                requestedNick[netID] = (n, Date())  // deliberate → persist when it lands
+                Task { await client.changeNick(n, networkID: netID) }
+            }
         case "topic": Task { await client.setTopic(arg, conversationID: selectedID) }
         case "whois":
             whoisTargetConvID = selectedID
@@ -525,6 +603,9 @@ final class AppModel {
             // Any other slash command (/mode, /kick, /invite, /away, /list, /who,
             // /names, /op, …) is sent through as a raw IRC command.
             guard !netID.isEmpty else { return }
+            // Numeric replies to a raw command (/who, /whowas, …) should land
+            // in the window you typed it in, not in a stale whois target.
+            whoisTargetConvID = selectedID
             let verb = cmd.uppercased()
             let raw = arg.isEmpty ? verb : "\(verb) \(arg)"
             Task { await client.sendRaw(raw, networkID: netID) }
@@ -534,17 +615,57 @@ final class AppModel {
 
     // MARK: Channel / DM management
 
+    /// `/join #chan [key]`. ALWAYS sends JOIN — an already-open window used to
+    /// swallow the command entirely, so re-joining after a kick/ban (or after
+    /// being unbanned) did nothing at all.
     func joinChannel(_ name: String) {
         guard let net = selectedNetwork else { return }
-        let chan = name.hasPrefix("#") ? name : "#\(name)"
+        let words = name.split(separator: " ").map(String.init)
+        let raw = words.first ?? ""
+        guard !raw.isEmpty else { return }
+        let key = words.count > 1 ? words[1] : nil
+        let chan = AppModel.normalizedChannel(raw)
         let id = canonicalConvID("\(net.id)/\(chan)")   // case-insensitive reuse
         if conversations[id] == nil {
             conversations[id] = Conversation(id: id, kind: .channel, name: chan,
                                              members: [Member(nick: net.nick)])
             mutateNetwork(net.id) { if !$0.conversationIDs.contains(id) { $0.conversationIDs.append(id) } }
-            Task { await client.join(channel: chan, networkID: net.id) }
+        } else {
+            appendMessage(to: id, Message(id: UUID().uuidString, kind: .server,
+                                          text: "*** Joining \(chan)…"))
         }
+        Task { await client.join(channel: chan, key: key, networkID: net.id) }
         select(id)
+    }
+
+    /// Channel names may start with #, &, + or ! — anything else gets a '#'.
+    /// One definition, so /join and /cycle can never disagree.
+    static func normalizedChannel(_ name: String) -> String {
+        guard let f = name.first else { return name }
+        return "#&+!".contains(f) ? name : "#\(name)"
+    }
+
+    /// Leave and immediately re-join a channel, keeping its window and
+    /// scrollback. Standard trick to drop a stale ban/mode state or to regain
+    /// ops in an empty channel.
+    func cycleChannel(_ id: String) {
+        guard let conv = conversations[id], conv.kind == .channel,
+              let net = network(for: id) else {
+            // No window open for it — cycling is just joining.
+            let name = String(id.split(separator: "/").dropFirst().joined(separator: "/"))
+            if !name.isEmpty, name != "$server" { joinChannel(name) }
+            return
+        }
+        let chan = conv.name
+        let key = conv.modeKey
+        appendMessage(to: id, Message(id: UUID().uuidString, kind: .server,
+                                      text: "*** Cycling \(chan)…"))
+        // Members will be repopulated by the fresh NAMES burst.
+        mutateConversation(id) { $0.members.removeAll() }
+        Task {
+            await client.sendRaw("PART \(chan) :cycling", networkID: net.id)
+            await client.join(channel: chan, key: key, networkID: net.id)
+        }
     }
 
     func partCurrent() { remove(selectedID) }
@@ -1026,7 +1147,7 @@ final class AppModel {
                 .map(\.name) ?? []
             var seen = Set<String>()
             for channel in cfg.autoJoinChannels + sidebar {
-                let norm = (channel.hasPrefix("#") || channel.hasPrefix("&") ? channel : "#\(channel)").lowercased()
+                let norm = AppModel.normalizedChannel(channel).lowercased()
                 guard seen.insert(norm).inserted else { continue }
                 self.joinOnConnect(channel, networkID: networkID)
             }
@@ -1118,13 +1239,13 @@ final class AppModel {
 
     /// Join a channel as part of auto-join without stealing the current selection.
     private func joinOnConnect(_ name: String, networkID: String) {
-        let chan = name.hasPrefix("#") || name.hasPrefix("&") ? name : "#\(name)"
+        let chan = AppModel.normalizedChannel(name)
         let id = canonicalConvID("\(networkID)/\(chan)")   // case-insensitive reuse
         if conversations[id] == nil {
             conversations[id] = Conversation(id: id, kind: .channel, name: chan, members: [])
             mutateNetwork(networkID) { if !$0.conversationIDs.contains(id) { $0.conversationIDs.append(id) } }
         }
-        Task { await client.join(channel: chan, networkID: networkID) }
+        Task { await client.join(channel: chan, key: nil, networkID: networkID) }
     }
 
     /// Translate a perform entry into a raw IRC line. Accepts raw IRC

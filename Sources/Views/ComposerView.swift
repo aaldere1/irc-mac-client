@@ -14,7 +14,7 @@ struct ComposerView: View {
 
     private struct Command { let cmd: String; let args: String; let desc: String }
     private let commands: [Command] = [
-        .init(cmd: "join", args: "#channel", desc: "Join a channel"),
+        .init(cmd: "join", args: "#channel [key]", desc: "Join a channel"),
         .init(cmd: "msg", args: "<nick> <text>", desc: "Send a private message"),
         .init(cmd: "me", args: "<action>", desc: "Send an action"),
         .init(cmd: "nick", args: "<newnick>", desc: "Change your nickname"),
@@ -24,6 +24,7 @@ struct ComposerView: View {
         .init(cmd: "silence", args: "<nick|+mask>", desc: "Server-side ignore (Undernet)"),
         .init(cmd: "query", args: "<nick>", desc: "Open a private chat"),
         .init(cmd: "part", args: "", desc: "Leave the current channel"),
+        .init(cmd: "cycle", args: "[#channel]", desc: "Leave and re-join (keeps the window)"),
         .init(cmd: "quit", args: "<message>", desc: "Disconnect from the server"),
     ]
 

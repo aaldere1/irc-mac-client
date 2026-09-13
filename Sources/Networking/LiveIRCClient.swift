@@ -24,6 +24,13 @@ actor LiveIRCClient: IRCClient {
     private let baseNick: String
     private let altNick: String
     private var nickAttempt = 0
+    /// Nick held before an optimistic /nick, for rollback when it is refused.
+    private var previousNick: String?
+    /// Nick set deliberately while disconnected (private session) — survives
+    /// into the next registration.
+    private var nickOverride: String?
+    /// The configured nick, kept current by the hub as settings change.
+    private var configNick: String
     private var registered = false
     private var namesBuffer: [String: [Member]] = [:]   // channel → names accumulated across 353s
     private var banBuffer: [String: [String]] = [:]     // channel → ban masks accumulated across 367s
@@ -99,6 +106,7 @@ actor LiveIRCClient: IRCClient {
         self.useTLS = config.useTLS
         self.nick = config.nick
         self.baseNick = config.nick
+        self.configNick = config.nick
         self.altNick = config.altNick
         self.username = config.effectiveUsername
         self.realName = config.realName.isEmpty ? config.nick : config.realName
@@ -117,11 +125,19 @@ actor LiveIRCClient: IRCClient {
         // Reset per-session state — this instance is reused across reconnects.
         registered = false
         nickAttempt = 0
+        // Start every session from the nick we're meant to use: an explicit
+        // pre-connect override (private session) wins, otherwise the current
+        // configured nick — never a fallback or refused nick left over from the
+        // last session.
+        nick = nickOverride ?? configNick
+        nickOverride = nil
+        previousNick = nil
         buffer.removeAll()
         sendQueue.removeAll()
         sendPump?.cancel()
         sendTimer = .distantPast
         namesBuffer.removeAll(); banBuffer.removeAll(); listBuffer.removeAll()
+        isupport.removeAll(); chanTypes = "#&"
 
         emit(.stateChanged(networkID: networkID, .connecting))
         emit(.serverLine(networkID: networkID, text: "*** Connecting to \(host):\(port) (\(useTLS ? "TLS" : "plain"))…"))
@@ -152,9 +168,14 @@ actor LiveIRCClient: IRCClient {
             rawSend(IRCParser.serialize(command: "NICK", params: [nick]))
             rawSend(IRCParser.serialize(command: "USER", params: [username, "0", "*", realName]))
         case .failed(let error):
+            // Drop the handle too — `connection != nil` is our "do we have a
+            // socket" test, and a stale one sends a private session's nick
+            // into the void instead of registering with it.
+            connection = nil
             emit(.serverLine(networkID: networkID, text: "*** Connection failed: \(error.localizedDescription)"))
             emit(.stateChanged(networkID: networkID, .disconnected))
         case .cancelled:
+            connection = nil
             emit(.stateChanged(networkID: networkID, .disconnected))
         default:
             break
@@ -176,7 +197,10 @@ actor LiveIRCClient: IRCClient {
     }
 
     private func continueReceive() { if let c = connection { receiveLoop(on: c) } }
-    private func emitDisconnect() { emit(.stateChanged(networkID: networkID, .disconnected)) }
+    private func emitDisconnect() {
+        connection = nil
+        emit(.stateChanged(networkID: networkID, .disconnected))
+    }
 
     // MARK: Framing — split on CRLF, parse each line
 
@@ -209,25 +233,47 @@ actor LiveIRCClient: IRCClient {
             emit(.serverLine(networkID: networkID, text: "*** SASL: \(msg.trailing ?? "authentication failed")"))
             rawSend(IRCParser.serialize(command: "CAP", params: ["END"]))
         case "433", "436", "437":   // nick in use / collision / unavailable
-            guard !registered else { break }
+            // Post-registration these are refusals of a /nick we asked for
+            // (or ircu's 437 "banned on channel"): report, keep the old nick.
+            guard !registered else {
+                // A /nick we asked for was refused — put our own copy back.
+                if let prev = previousNick {
+                    nick = prev
+                    previousNick = nil
+                }
+                emitNumeric(msg)
+                break
+            }
             let old = nick
             nick = nextNick()
             emit(.serverLine(networkID: networkID, text: "*** Nick \"\(old)\" is taken — trying \"\(nick)\""))
             rawSend(IRCParser.serialize(command: "NICK", params: [nick]))
             emit(.nickChanged(networkID: networkID, from: old, to: nick))
-        case "432":                 // erroneous nickname
-            guard !registered else { break }
+        case "432", "438":          // erroneous nickname / nick change too fast
+            guard !registered else {
+                if let prev = previousNick { nick = prev; previousNick = nil }
+                emitNumeric(msg)
+                break
+            }
+            guard msg.command == "432" else { break }
             let old = nick
             nick = "Relay\(abs(old.hashValue) % 100000)"
             rawSend(IRCParser.serialize(command: "NICK", params: [nick]))
             emit(.nickChanged(networkID: networkID, from: old, to: nick))
         case "001":
             registered = true
+            previousNick = nil
+            // RPL_WELCOME's first param is the nick we actually got. Emit it
+            // BEFORE .connected so the perform list expands %nick% correctly.
+            if let confirmed = msg.params.first, !confirmed.isEmpty, confirmed != "*" {
+                nick = confirmed
+                emit(.selfNickConfirmed(networkID: networkID, nick: confirmed))
+            }
             emit(.stateChanged(networkID: networkID, .connected))
             emit(.serverLine(networkID: networkID, text: msg.trailing ?? "Welcome"))
         case "PRIVMSG":
             guard let target = msg.params.first, let body = msg.trailing else { break }
-            let convID = "\(networkID)/\(target.hasPrefix("#") ? target : (msg.sourceNick ?? target))"
+            let convID = "\(networkID)/\(isChannel(target) ? target : (msg.sourceNick ?? target))"
             // CTCP request (e.g. VERSION, PING) — answer via NOTICE, don't render.
             if body.hasPrefix("\u{01}"), !body.hasPrefix("\u{01}ACTION "), let from = msg.sourceNick {
                 answerCTCP(body: body, from: from)
@@ -249,7 +295,7 @@ actor LiveIRCClient: IRCClient {
             // Channel notice → channel; user/service notice → DM with the sender;
             // server notice (no nick source) → server console.
             let convID: String
-            if target.hasPrefix("#") || target.hasPrefix("&") {
+            if isChannel(target) {
                 convID = "\(networkID)/\(target)"
             } else if let from = msg.sourceNick, !from.isEmpty {
                 convID = "\(networkID)/\(from)"
@@ -266,22 +312,31 @@ actor LiveIRCClient: IRCClient {
             }
         case "PART":
             if let nick = msg.sourceNick, let chan = msg.params.first {
+                // ":nick PART #chan" has no reason — params.last is the channel
+                // itself, so only treat a SECOND param as the part message.
+                let reason = msg.params.count > 1 ? (msg.params.last ?? "") : ""
                 emit(.memberLeft(conversationID: "\(networkID)/\(chan)",
-                                 nick: nick, reason: msg.trailing ?? "", kind: .part))
+                                 nick: nick, reason: reason.isEmpty ? "left" : "left (\(reason))",
+                                 kind: .part))
             }
         case "QUIT":
             if let nick = msg.sourceNick {
-                emit(.userQuit(networkID: networkID, nick: nick, reason: msg.trailing ?? "Quit"))
+                let reason = msg.params.last ?? ""
+                emit(.userQuit(networkID: networkID, nick: nick,
+                               reason: reason.isEmpty ? "quit" : "quit (\(reason))"))
             }
         case "KICK":
             // KICK <channel> <nick> :<reason>
             if msg.params.count >= 2 {
                 let by = msg.sourceNick ?? "?"
-                let reason = msg.trailing ?? ""
+                // ":by KICK #chan nick" may carry no reason — params.last is
+                // then the kicked nick, not a message.
+                let reason = msg.params.count > 2 ? (msg.params.last ?? "") : ""
+                let who = msg.params[1]
                 emit(.memberLeft(conversationID: "\(networkID)/\(msg.params[0])",
-                                 nick: msg.params[1],
-                                 reason: "was kicked by \(by)\(reason.isEmpty ? "" : " (\(reason))")",
-                                 kind: .part))
+                                 nick: who,
+                                 reason: "*** \(who) was kicked by \(by)\(reason.isEmpty ? "" : " (\(reason))")",
+                                 kind: .kick))
             }
         case "TOPIC", "332":
             if let chan = msg.params.dropFirst(msg.command == "332" ? 1 : 0).first,
@@ -326,7 +381,21 @@ actor LiveIRCClient: IRCClient {
         case "324":   // RPL_CHANNELMODEIS — current modes on join/query
             handleChannelModeIs(msg)
         case "NICK":
-            if let from = msg.sourceNick, let to = msg.trailing {
+            // ircu sends the new nick as a plain param (":old NICK new"), other
+            // servers as a trailing (":old NICK :new") — accept both.
+            if let from = msg.sourceNick, let to = msg.params.last, !to.isEmpty {
+                // Our own nick changed (or was changed for us by the server) —
+                // keep the transport's copy in step or every later self-check
+                // (echo, highlight, member rename) compares against a dead nick.
+                // Match on `to` as well: changeNick already moved `nick` to the
+                // new value optimistically, so the echo's `from` no longer
+                // matches it — without this the rollback slot is never cleared
+                // and a later refusal reverts us to a dead nick.
+                if from.caseInsensitiveCompare(nick) == .orderedSame
+                    || to.caseInsensitiveCompare(nick) == .orderedSame {
+                    nick = to
+                    previousNick = nil          // accepted — nothing to roll back
+                }
                 emit(.nickChanged(networkID: networkID, from: from, to: to))
             }
         case "INVITE":
@@ -348,25 +417,231 @@ actor LiveIRCClient: IRCClient {
                 emit(.joinFailed(networkID: networkID, channel: msg.params[1],
                                  code: Int(msg.command) ?? 0, reason: msg.trailing ?? ""))
             }
-        case "329", "333", "315":
-            break   // creation/topic timestamps & WHO end-marker — noise
+        case "329", "333":
+            break   // channel creation / topic-set timestamps — noise
+
+        // ---- Registration / server info ----
+        case "005":   // RPL_ISUPPORT — learn this server's capabilities
+            handleISupport(msg)
+        case "002", "003", "004", "010", "250", "251", "252", "253", "254",
+             "255", "256", "257", "258", "259", "265", "266",
+             "371", "372", "374", "375", "376", "422":
+            emit(.serverLine(networkID: networkID, text: msg.params.last ?? ""))
+
+        // ---- Away ----
+        case "305", "306":
+            emit(.serverLine(networkID: networkID, text: msg.params.last ?? ""))
+        case "AWAY":
+            // IRCv3 away-notify: ":nick AWAY [:reason]"
+            if let who = msg.sourceNick {
+                let reason = msg.params.last ?? ""
+                emit(.serverLine(networkID: networkID,
+                                 text: reason.isEmpty ? "*** \(who) is back"
+                                                      : "*** \(who) is away: \(reason)"))
+            }
+
+        // ---- WHO / WHOWAS ----
+        case "352": emit(.whois(networkID: networkID, text: formatWho(msg)))
+        case "315": break                                    // end of WHO — marker only
+        case "314", "369": emit(.whois(networkID: networkID, text: formatWhois(msg)))
+
+        // ---- Invites / invite & except lists ----
+        case "341":   // RPL_INVITING <me> <nick> <channel>
+            if msg.params.count >= 3 {
+                emitToChannel(msg.params[2], "*** Invited \(msg.params[1]) to \(msg.params[2])")
+            } else { emitNumeric(msg) }
+        case "346", "347", "348", "349":
+            emitNumeric(msg)
+
+        // ---- Undernet SILENCE list ----
+        case "271", "272":
+            emit(.serverLine(networkID: networkID, text: msg.params.dropFirst().joined(separator: " ")))
+
+        // ---- Server-sent errors & notices that are not numerics ----
+        case "ERROR":
+            emit(.serverLine(networkID: networkID, text: "*** Server error: \(msg.params.last ?? "")"))
+            emit(.stateChanged(networkID: networkID, .disconnected))
+        case "WALLOPS":
+            emit(.serverLine(networkID: networkID,
+                             text: "*** WALLOPS from \(msg.sourceNick ?? "server"): \(msg.params.last ?? "")"))
+        case "KILL":
+            let who = msg.params.first ?? ""
+            emit(.serverLine(networkID: networkID,
+                             text: "*** \(who) was killed by \(msg.sourceNick ?? "server"): \(msg.params.last ?? "")"))
+        case "SILENCE":
+            emit(.serverLine(networkID: networkID, text: "*** SILENCE \(msg.params.joined(separator: " "))"))
+        case "ACCOUNT":
+            if let who = msg.sourceNick {
+                let acct = msg.params.last ?? "*"
+                emit(.serverLine(networkID: networkID,
+                                 text: acct == "*" ? "*** \(who) logged out"
+                                                   : "*** \(who) is now logged in as \(acct)"))
+            }
+        case "CHGHOST":
+            if let who = msg.sourceNick, msg.params.count >= 2 {
+                emit(.serverLine(networkID: networkID,
+                                 text: "*** \(who) is now \(msg.params[0])@\(msg.params[1])"))
+            }
+
         default:
-            // Other numerics: show the full, readable line (drop the leading
-            // <me> target). Non-numeric junk is ignored.
+            // Every remaining numeric is rendered readably and routed to the
+            // channel it concerns when it names one; unknown non-numeric verbs
+            // are still surfaced rather than swallowed.
             if Int(msg.command) != nil {
-                let text = msg.params.dropFirst().joined(separator: " ")
-                if !text.isEmpty { emit(.serverLine(networkID: networkID, text: text)) }
+                emitNumeric(msg)
+            } else if let src = msg.prefix, !src.isEmpty {
+                let body = msg.params.joined(separator: " ")
+                if !body.isEmpty {
+                    emit(.serverLine(networkID: networkID, text: "\(msg.command) \(body)"))
+                }
             }
         }
     }
 
+    // MARK: Generic numeric rendering (RFC 1459 / 2812 + ircu)
+
+    /// Channel prefix characters this server uses (RPL_ISUPPORT CHANTYPES).
+    private var chanTypes = "#&"
+    /// Everything RPL_ISUPPORT told us, for reference and future use.
+    private var isupport: [String: String] = [:]
+
+    private func isChannel(_ s: String) -> Bool {
+        guard let f = s.first else { return false }
+        return chanTypes.contains(f)
+    }
+
+    private func handleISupport(_ msg: IRCMessage) {
+        // <me> <TOKEN[=value]>… :are supported by this server
+        for token in msg.params.dropFirst().dropLast() {
+            let bits = token.split(separator: "=", maxSplits: 1).map(String.init)
+            guard let key = bits.first, !key.isEmpty else { continue }
+            let value = bits.count > 1 ? bits[1] : ""
+            isupport[key.uppercased()] = value
+            if key.uppercased() == "CHANTYPES", !value.isEmpty { chanTypes = value }
+        }
+        let summary = msg.params.dropFirst().dropLast().joined(separator: " ")
+        if !summary.isEmpty { emit(.serverLine(networkID: networkID, text: summary)) }
+    }
+
+    /// Send a line into a channel's window — but only if that window already
+    /// exists (the app decides); otherwise it lands in the server console. A
+    /// numeric about a channel you are NOT in must never create a sidebar row,
+    /// or the next reconnect would auto-rejoin it.
+    private func emitToChannel(_ channel: String, _ text: String) {
+        guard isChannel(channel) else {
+            emit(.serverLine(networkID: networkID, text: text)); return
+        }
+        emit(.contextLine(conversationID: "\(networkID)/\(channel)", text: text))
+    }
+
+    /// Render any numeric as a readable line: "<subject> — <text>", named when
+    /// we know the numeric, prefixed "***" for errors (4xx/5xx), and delivered
+    /// to the channel window when the numeric names a channel.
+    private func emitNumeric(_ msg: IRCMessage) {
+        let code = msg.command
+        var fields = msg.params
+        if fields.count > 1 { fields.removeFirst() }        // drop the <me> target
+        let text = fields.popLast() ?? ""
+        // Scan for a channel only among the SUBJECT params — the human text is
+        // free-form and may legitimately start with '#'.
+        let channel = fields.first(where: { isChannel($0) })
+        let subject = fields.joined(separator: " ")
+
+        var line: String
+        if subject.isEmpty { line = text }
+        else if text.isEmpty { line = subject }
+        else { line = "\(subject) — \(text)" }
+        if line.isEmpty { line = Self.numericNames[code] ?? code }
+
+        let isError = code.hasPrefix("4") || code.hasPrefix("5")
+        if isError {
+            let name = Self.numericNames[code]
+            line = "*** " + line + (name == nil ? " (\(code))" : "")
+        }
+        if let channel { emitToChannel(channel, line) }
+        else { emit(.serverLine(networkID: networkID, text: line)) }
+    }
+
+    /// RPL_WHOREPLY 352: <me> <chan> <user> <host> <server> <nick> <flags> :<hops> <real>
+    private func formatWho(_ msg: IRCMessage) -> String {
+        let p = msg.params
+        guard p.count >= 7 else { return msg.params.dropFirst().joined(separator: " ") }
+        let chan = p[1], user = p[2], host = p[3], nick = p[5], flags = p[6]
+        let real = (msg.params.last ?? "").split(separator: " ").dropFirst().joined(separator: " ")
+        var marks: [String] = []
+        if flags.contains("G") { marks.append("away") }
+        if flags.contains("*") { marks.append("ircop") }
+        if flags.contains("@") { marks.append("op") }
+        if flags.contains("+") { marks.append("voice") }
+        let suffix = marks.isEmpty ? "" : " [\(marks.joined(separator: ", "))]"
+        return "\(nick) \(user)@\(host) on \(chan)\(suffix) — \(real)"
+    }
+
+    /// Names for the numerics we render generically — RFC 1459/2812 plus the
+    /// ircu (Undernet) additions. Used to label errors; unknown codes still
+    /// render their text.
+    private static let numericNames: [String: String] = [
+        // command responses
+        "200": "TRACELINK", "201": "TRACECONNECTING", "202": "TRACEHANDSHAKE",
+        "203": "TRACEUNKNOWN", "204": "TRACEOPERATOR", "205": "TRACEUSER",
+        "206": "TRACESERVER", "208": "TRACENEWTYPE", "209": "TRACECLASS",
+        "211": "STATSLINKINFO", "212": "STATSCOMMANDS", "213": "STATSCLINE",
+        "214": "STATSNLINE", "215": "STATSILINE", "216": "STATSKLINE",
+        "217": "STATSQLINE", "218": "STATSYLINE", "219": "ENDOFSTATS",
+        "221": "UMODEIS", "222": "STATSJLINE", "231": "SERVICEINFO",
+        "234": "SERVLIST", "235": "SERVLISTEND", "241": "STATSLLINE",
+        "242": "STATSUPTIME", "243": "STATSOLINE", "244": "STATSHLINE",
+        "246": "STATSPING", "247": "STATSGLINE", "248": "STATSULINE",
+        "261": "TRACELOG", "262": "TRACEEND", "263": "TRYAGAIN",
+        "280": "GLIST", "281": "ENDOFGLIST", "304": "TEXT",
+        "307": "WHOISREGNICK", "310": "WHOISHELPOP", "320": "WHOISSPECIAL",
+        "334": "LISTUSAGE", "335": "WHOISBOT", "379": "WHOISMODES",
+        "381": "YOUREOPER", "382": "REHASHING", "391": "TIME",
+        "392": "USERSSTART", "393": "USERS", "394": "ENDOFUSERS", "395": "NOUSERS",
+        // errors
+        "401": "No such nick/channel", "402": "No such server",
+        "403": "No such channel", "404": "Cannot send to channel",
+        "405": "Too many channels", "406": "No such nick (was)",
+        "407": "Too many targets", "408": "No such service",
+        "409": "No origin specified", "411": "No recipient given",
+        "412": "No text to send", "413": "No toplevel domain",
+        "414": "Wildcard in toplevel domain", "421": "Unknown command",
+        "422": "No MOTD", "423": "No admin info", "424": "File error",
+        "431": "No nickname given", "432": "Erroneous nickname",
+        "433": "Nickname is already in use", "436": "Nick collision",
+        "437": "Nick/channel temporarily unavailable",
+        "438": "Nick change too fast", "439": "Target change too fast",
+        "441": "They aren't on that channel", "442": "You're not on that channel",
+        "443": "Is already on channel", "444": "User not logged in",
+        "445": "SUMMON disabled", "446": "USERS disabled",
+        "451": "You have not registered", "461": "Not enough parameters",
+        "462": "You may not reregister", "463": "Your host isn't among the privileged",
+        "464": "Password incorrect", "465": "You are banned from this server",
+        "466": "You will be banned", "467": "Channel key already set",
+        "471": "Channel is full", "472": "Unknown mode char",
+        "473": "Invite only channel", "474": "You are banned from the channel",
+        "475": "Bad channel key", "476": "Bad channel mask",
+        "477": "Needs a registered nick", "478": "Channel ban list is full",
+        "481": "Permission denied — you're not an IRC operator",
+        "482": "You're not channel operator", "483": "You can't kill a server",
+        "484": "Your connection is restricted", "485": "Not the original channel operator",
+        "491": "No O-lines for your host", "492": "No CTCP allowed",
+        "501": "Unknown MODE flag", "502": "Can't change mode for other users",
+        "511": "Silence list is full", "512": "Too many watch entries",
+        "513": "Bad PING response", "524": "No such help topic",
+    ]
+
     /// Next nick to try on a collision: the configured alternate first, then the
     /// base nick with growing underscores, then a numeric suffix.
     private func nextNick() -> String {
+        // Ladder from the nick we are actually trying to register with, not the
+        // one this object was created with — a persisted rename would otherwise
+        // fall back to the old config's nick.
+        let base = configNick.isEmpty ? baseNick : configNick
         nickAttempt += 1
-        if nickAttempt == 1, !altNick.isEmpty, altNick != baseNick { return altNick }
-        if nickAttempt <= 3 { return baseNick + String(repeating: "_", count: nickAttempt) }
-        return baseNick + "\(nickAttempt)"
+        if nickAttempt == 1, !altNick.isEmpty, altNick != base { return altNick }
+        if nickAttempt <= 3 { return base + String(repeating: "_", count: nickAttempt) }
+        return base + "\(nickAttempt)"
     }
 
     // MARK: CAP / SASL negotiation
@@ -412,7 +687,7 @@ actor LiveIRCClient: IRCClient {
     private func handleMode(_ msg: IRCMessage) {
         guard let target = msg.params.first else { return }
         // User mode (target is a nick, not a channel) — not tracked in UI yet.
-        guard target.hasPrefix("#") || target.hasPrefix("&") else { return }
+        guard isChannel(target) else { return }
         let convID = "\(networkID)/\(target)"
         let tokens = Array(msg.params.dropFirst())
         guard let modeString = tokens.first else { return }
@@ -427,19 +702,19 @@ actor LiveIRCClient: IRCClient {
                 let takesArg = adding ? LiveIRCClient.paramOnSet.contains(ch)
                                       : LiveIRCClient.paramOnUnset.contains(ch)
                 let arg = takesArg && !args.isEmpty ? args.removeFirst() : nil
-                applyMode(ch, adding: adding, arg: arg, convID: convID)
+                applyMode(ch, adding: adding, arg: arg, convID: convID, by: msg.sourceNick)
             }
         }
     }
 
-    private func applyMode(_ ch: Character, adding: Bool, arg: String?, convID: String) {
+    private func applyMode(_ ch: Character, adding: Bool, arg: String?, convID: String, by: String? = nil) {
         switch ch {
         case "o":
             if let nick = arg { emit(.modeChanged(conversationID: convID, nick: nick, mode: adding ? .op : .regular)) }
         case "v":
             if let nick = arg { emit(.modeChanged(conversationID: convID, nick: nick, mode: adding ? .voice : .regular)) }
         case "b":
-            if let mask = arg { emit(.ban(conversationID: convID, mask: mask, added: adding)) }
+            if let mask = arg { emit(.ban(conversationID: convID, mask: mask, added: adding, by: by ?? "")) }
         default:
             emit(.channelModeChanged(conversationID: convID, letter: String(ch), enabled: adding, arg: arg))
         }
@@ -528,8 +803,12 @@ actor LiveIRCClient: IRCClient {
         let target = String(conversationID.split(separator: "/").last ?? "")
         rawSend(IRCParser.serialize(command: "PRIVMSG", params: [target, "\u{01}ACTION \(action)\u{01}"]))
     }
-    func join(channel: String, networkID: String) async {
-        rawSend(IRCParser.serialize(command: "JOIN", params: [channel]))
+    func join(channel: String, key: String?, networkID: String) async {
+        if let key, !key.isEmpty {
+            rawSend(IRCParser.serialize(command: "JOIN", params: [channel, key]))
+        } else {
+            rawSend(IRCParser.serialize(command: "JOIN", params: [channel]))
+        }
     }
     func part(conversationID: String) async {
         let target = String(conversationID.split(separator: "/").last ?? "")
@@ -540,8 +819,28 @@ actor LiveIRCClient: IRCClient {
         rawSend(IRCParser.serialize(command: "TOPIC", params: [target, topic]))
     }
     func changeNick(_ nick: String, networkID: String) async {
+        // Optimistic, but remembered: if the server refuses (432/433/436/437/438)
+        // we roll back, or every later self-check compares against a nick we
+        // never actually held.
+        // Only the first pending change records the rollback target — a second
+        // /nick in flight must not make a never-held candidate the fallback.
+        if previousNick == nil { previousNick = self.nick }
         self.nick = nick
+        guard connection != nil else {
+            // Chosen before we connect (private session) — this IS the nick we
+            // will register with; there is no socket to tell.
+            nickOverride = nick
+            previousNick = nil
+            return
+        }
         rawSend(IRCParser.serialize(command: "NICK", params: [nick]))
+    }
+
+    /// Keep the transport's idea of the configured nick current (settings edit
+    /// or a persisted rename), so the next connect registers correctly.
+    func updateNick(_ n: String) {
+        guard !n.isEmpty else { return }
+        configNick = n
     }
     func whois(nick: String, conversationID: String) async {
         // "WHOIS <nick> <nick>" queries the server the user is ON — required

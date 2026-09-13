@@ -19,7 +19,14 @@ actor IRCHub: IRCClient {
 
     /// Keep the hub's view of server configs current (creds, host, …).
     func updateConfigs(_ list: [ServerConfig]) {
-        for c in list { configs[c.id] = c }
+        for c in list {
+            configs[c.id] = c
+            // An already-created client keeps its own copy — push the nick
+            // through or a persisted rename never reaches the next connect.
+            if let client = live[c.id] {
+                Task { await client.updateNick(c.nick) }
+            }
+        }
     }
 
     private func forward(_ stream: AsyncStream<IRCEvent>) {
@@ -46,7 +53,7 @@ actor IRCHub: IRCClient {
     func connect(networkID: String) async { await transport(for: networkID).connect(networkID: networkID) }
     func disconnect(networkID: String) async { await transport(for: networkID).disconnect(networkID: networkID) }
     func sendRaw(_ line: String, networkID: String) async { await transport(for: networkID).sendRaw(line, networkID: networkID) }
-    func join(channel: String, networkID: String) async { await transport(for: networkID).join(channel: channel, networkID: networkID) }
+    func join(channel: String, key: String?, networkID: String) async { await transport(for: networkID).join(channel: channel, key: key, networkID: networkID) }
     func changeNick(_ nick: String, networkID: String) async { await transport(for: networkID).changeNick(nick, networkID: networkID) }
 
     func send(text: String, to conversationID: String) async {

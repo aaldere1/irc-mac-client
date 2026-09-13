@@ -73,6 +73,7 @@ enum MessageKind: String, Codable {
     case join
     case part
     case quit
+    case kick         // KICK — never collapsed into the join/part group
 }
 
 struct LinkPreview: Hashable {
@@ -93,6 +94,8 @@ struct Message: Identifiable, Hashable {
     var preview: LinkPreview? = nil
 
     var isJoinPartQuit: Bool { kind == .join || kind == .part || kind == .quit }
+    /// Rows that carry a reason worth reading on its own line.
+    var isCalledOut: Bool { kind == .kick }
 
     // DateFormatter init is expensive — one shared instance, never per-row.
     private static let timeFormatter: DateFormatter = {
