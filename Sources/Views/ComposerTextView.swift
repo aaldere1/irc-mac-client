@@ -76,19 +76,28 @@ struct ComposerTextView: NSViewRepresentable {
 
         // Don't clobber an IME composition, and don't push the string back
         // into the view when the view itself just published it.
+        var replacedText = false
         if !textView.hasMarkedText(), textView.string != text {
             context.coordinator.applying = true
             textView.string = text
             context.coordinator.applying = false
+            replacedText = true
         }
+        // A mouse or keyboard selection reports only its start through
+        // caretUTF16. Echoing that as a zero-length range collapses the
+        // selection on the next SwiftUI update. Move the caret when the
+        // text was replaced, or when SwiftUI asked for a different position.
         if !textView.hasMarkedText() {
             let length = (textView.string as NSString).length
             let loc = min(max(0, caretUTF16), length)
-            let range = NSRange(location: loc, length: 0)
-            if textView.selectedRange() != range {
-                context.coordinator.applying = true
-                textView.setSelectedRange(range)
-                context.coordinator.applying = false
+            let current = textView.selectedRange()
+            if replacedText || current.location != loc {
+                let range = NSRange(location: loc, length: 0)
+                if current != range {
+                    context.coordinator.applying = true
+                    textView.setSelectedRange(range)
+                    context.coordinator.applying = false
+                }
             }
         }
         context.coordinator.publishHeight()
@@ -145,6 +154,13 @@ final class RelayTextView: NSTextView {
         // chain. Only the bare editing keys are intercepted.
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) {
+            super.keyDown(with: event)
+            return
+        }
+        // Return confirms an IME candidate. Sending here would post the
+        // unfinished composition. Arrows, Escape, and Tab belong to the
+        // input method for the same reason.
+        if hasMarkedText() {
             super.keyDown(with: event)
             return
         }
